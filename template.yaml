@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform:
+  - "AWS::Serverless-2016-10-31"
+Parameters:
+  Environment:
+    Type: String
+Globals:
+  Function:
+      Runtime: nodejs14.x
+      MemorySize: 256
+      Timeout: 15
+Resources:
+  LambdaCreation:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: ./src
+      Handler: lambda/creation.handler
+      Events:
+        LambdaCreationEvent:
+          Type: EventBridgeRule
+          Properties:
+            InputPath: $.detail.requestParameters
+            EventBusName: default
+            Pattern:
+              source:
+                - aws.lambda
+              detail-type:
+                - AWS API Call via CloudTrail
+              detail:
+                eventName:
+                  - prefix: CreateFunction
+      Policies:
+        - Version: 2012-10-17
+          Statement:
+            - Sid: Statement1
+              Effect: Allow
+              Action:
+                - "cloudwatch:PutMetricAlarm"
+              Resource: "*"
+        - Version: 2012-10-17
+          Statement:
+            - Sid: Statement2
+              Effect: Allow
+              Action:
+                - "cloudwatch:PutAnomalyDetector"
+              Resource: "*"
+  LambdaDeletion:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: ./src
+      Handler: lambda/deletion.handler
+      Events:
+        LambdaDeletionEvent:
+          Type: EventBridgeRule
+          Properties:
+            InputPath: $.detail.requestParameters
+            EventBusName: default
+            Pattern:
+              source:
+                - aws.lambda
+              detail-type:
+                - AWS API Call via CloudTrail
+              detail:
+                eventName:
+                  - prefix: DeleteFunction
+      Policies:
+        - Version: 2012-10-17
+          Statement:
+            - Sid: Statement1
+              Effect: Allow
+              Action:
+                - "cloudwatch:DeleteAlarms"
+              Resource: "*"
+        - Version: 2012-10-17
+          Statement:
+            - Sid: Statement2
+              Effect: Allow
+              Action:
+                - "cloudwatch:DeleteAnomalyDetector"
+              Resource: "*"
+  NotifierStateMachine:
+    Type: "AWS::Serverless::StateMachine"
+    Properties:
+      Name: !Sub "${AWS::StackName}-NotifierStateMachine"
+      Definition:
+        StartAt: Get tags
+        States:
+          Get tags:
+            Type: Task
+            Resource: !GetAtt TagLookup.Arn
+            Next: Check alarm state
+          Check alarm state:
+            Type: Choice
+            Choices:
+              - Variable: $.detail.state.value
+                StringEquals: ALARM
+                Next: Send alarm notification
+              - Variable: $.detail.state.value
+                StringEquals: OK
+                Next: Get message id
+          Get message id:
+            Type: Task
+            Resource: "arn:aws:states:::dynamodb:getItem"
+            ResultPath: $.message
+            Parameters:
+              TableName: !Ref Table
+              Key:
+                alarmName:
+                  S.$: $.detail.alarmName
+            Next: Send recovered notification
+          Send alarm notification:
+            Type: Task
+            Resource: !GetAtt SendAlarmNotification.Arn
+            Next: Post processing
+          Post processing:
+            Type: Parallel
+            End: true
+            Branches:
+              - StartAt: Service context choice
+                States:
+                  Service context choice:
+                    Type: Choice
+                    Choices:
+                      - Variable: $.detail.alarmName
+                        StringMatches: "*:lambda:errors:*"
+                        Next: Get error logs                    
+                  Get error logs:
+                    Type: Task
+                    Resource: !GetAtt GetErrorLogs.Arn
+                    End: true
+              - StartAt: Save message id
+                States:
+                  Save message id:
+                    Type: Task
+                    Resource: "arn:aws:states:::dynamodb:putItem"
+                    Parameters:
+                      TableName: !Ref Table
+                      Item:
+                        alarmName:
+                          S.$: $.detail.alarmName
+                        ts:
+                          S.$: $.ts
+                        channel:
+                          S.$: $.channelId
+                    End: true
+          Send recovered notification:
+            Type: Task
+            Resource: !GetAtt SendRecoveredNotification.Arn
+            Next: Delete message id
+          Delete message id:
+            Type: Task
+            Resource: "arn:aws:states:::dynamodb:deleteItem"
+            Parameters:
+              TableName: !Ref Table
+              Key:
+                alarmName:
+                  S.$: $.detail.alarmName
+            End: true
+      Events:
+        AlarmStateChange:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: default
+            Pattern:
+              source:
+                - aws.cloudwatch
+              detail-type:
+                - CloudWatch Alarm State Change
+              detail:
+                state:
+                  value:
+                    - ALARM
+                    - OK
+              resources:
+                - prefix: !Sub >-
+                    arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:auto:
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref TagLookup
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SendAlarmNotification
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SendRecoveredNotification
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GetErrorLogs
+        - DynamoDBCrudPolicy:
+            TableName: !Ref Table
+  TagLookup:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: ./src
+      Handler: tagLookup.handler
+      Environment:
+        Variables:
+          AccountId: !Ref "AWS::AccountId"
+      Policies:
+        - Version: 2012-10-17
+          Statement:
+            - Sid: Statement1
+              Effect: Allow
+              Action:
+                - "cloudwatch:ListTagsForResource"
+              Resource:
+                - "*"
+  SendAlarmNotification:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      Handler: src/sendAlarmNotification.handler
+      Environment:
+        Variables:
+          Environment: !Ref Environment
+          SlackToken: "{{resolve:secretsmanager:env-slack/Token:SecretString:Value}}"
+      MemorySize: 256
+      Timeout: 15
+  SendRecoveredNotification:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      Handler: src/sendRecoveredNotification.handler
+      Environment:
+        Variables:
+          Environment: !Ref Environment
+          SlackToken: "{{resolve:secretsmanager:env-slack/Token:SecretString:Value}}"
+      MemorySize: 256
+      Timeout: 15
+  GetErrorLogs:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      Handler: src/getErrorLogs.handler
+      Environment:
+        Variables:
+          Environment: !Ref Environment
+          SlackToken: "{{resolve:secretsmanager:env-slack/Token:SecretString:Value}}"
+      MemorySize: 512
+      Timeout: 60
+      Policies:
+        - Version: 2012-10-17
+          Statement:
+            - Sid: Statement1
+              Effect: Allow
+              Action:
+                - "logs:FilterLogEvents"
+              Resource:
+                - "*"
+  Table:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: alarmName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: alarmName
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
